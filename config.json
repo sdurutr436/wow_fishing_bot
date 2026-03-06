@@ -1,5 +1,5 @@
 {
-  "keybind": "`",
+  "keybind": ".",
   "iterations": 1000,
   "cast_animation_wait": 1.5,
   "cast_animation_variance": 0.3,
@@ -8,7 +8,7 @@
   "detection_timeout_seconds": 30,
   "post_detection_cooldown": 3.0,
   "min_human_delay": 0.05,
-  "max_human_delay": 0.30,
+  "max_human_delay": 0.3,
   "rms_threshold": 0.02,
   "audio_device_index": 41,
   "sample_rate": 44100,
@@ -21,5 +21,8 @@
   "bite_threshold_factor": 500.0,
   "min_absolute_threshold": 0.005,
   "ignore_after_cast_seconds": 0.5,
-  "bite_detection_timeout_secs": 20.0
+  "bite_detection_timeout_secs": 20.0,
+  "reset_factor": 2.0,
+  "iterations_before_cleanup": 40,
+  "calibration_duration_seconds": 2.0
 }

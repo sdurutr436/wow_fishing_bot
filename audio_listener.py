@@ -1,16 +1,22 @@
 """
-audio_listener.py — Captura de audio del sistema y detección de cast/bite.
+audio_listener.py -- Captura de audio del sistema y deteccion de cast/bite.
 
 Utiliza sounddevice con WASAPI loopback para capturar el audio de salida
-del sistema (NO micrófono). Implementa una máquina de estados por cast que
+del sistema (NO microfono). Implementa una maquina de estados por cast que
 distingue entre el pico de splash del cast (primer pico) y el pico del
-bite del pez (segundo pico), usando umbrales dinámicos basados en la
+bite del pez (segundo pico), usando umbrales dinamicos basados en la
 baseline RMS real (~0.00002 en idle).
 
+Modelo de reset-level:
+  Despues de cada pico, el RMS debe volver a caer por debajo
+  del *reset_level* (baseline_rms * reset_factor) antes de que
+  se acepte el siguiente pico.  Esto evita que reverberaciones
+  o picos prolongados se interpreten como dos eventos separados.
+
 Perfil RMS observado:
-  - Idle / fondo:  ~0.000017 – 0.000020
-  - Cast splash:   0.001 – 0.01+  (primer pico, IGNORAR)
-  - Fish bite:     0.001 – 0.01+  (segundo pico, LOOTEAR)
+  - Idle / fondo:  ~0.000017 - 0.000020
+  - Cast splash:   0.001 - 0.01+  (primer pico, IGNORAR)
+  - Fish bite:     0.001 - 0.01+  (segundo pico, LOOTEAR)
 """
 
 from __future__ import annotations
@@ -27,22 +33,23 @@ logger = logging.getLogger("fishing_bot.audio")
 
 
 # ---------------------------------------------------------------------------
-# Máquina de estados por cast
+# Maquina de estados por cast
 # ---------------------------------------------------------------------------
 
 
 class CastState(enum.Enum):
-    """Estados del ciclo de detección de audio por cada cast."""
+    """Estados del ciclo de deteccion de audio por cada cast."""
 
     WAITING_FOR_CAST_SPLASH = "waiting_for_cast_splash"
     IGNORING_FIRST_PEAK = "ignoring_first_peak"
+    WAITING_FOR_RESET = "waiting_for_reset"
     WAITING_FOR_BITE = "waiting_for_bite"
     BITE_DETECTED = "bite_detected"
     TIMED_OUT = "timed_out"
 
 
 class AudioListener:
-    """Captura audio del sistema y detecta el ciclo cast-splash → bite."""
+    """Captura audio del sistema y detecta el ciclo cast-splash -> bite."""
 
     # -----------------------------------------------------------------
     # Valores por defecto calibrados con datos reales
@@ -52,6 +59,7 @@ class AudioListener:
     DEFAULT_MIN_ABSOLUTE_THRESHOLD: float = 0.005
     DEFAULT_IGNORE_AFTER_CAST_SECS: float = 0.5
     DEFAULT_BITE_DETECTION_TIMEOUT: float = 20.0
+    DEFAULT_RESET_FACTOR: float = 2.0
 
     def __init__(
         self,
@@ -65,20 +73,22 @@ class AudioListener:
         min_absolute_threshold: float = DEFAULT_MIN_ABSOLUTE_THRESHOLD,
         ignore_after_cast_seconds: float = DEFAULT_IGNORE_AFTER_CAST_SECS,
         bite_detection_timeout_secs: float = DEFAULT_BITE_DETECTION_TIMEOUT,
+        reset_factor: float = DEFAULT_RESET_FACTOR,
     ) -> None:
-        """Inicializa el listener de audio con modelo de dos picos.
+        """Inicializa el listener de audio con modelo de dos picos y reset-level.
 
         Args:
-            device_index: Índice del dispositivo de audio (None = auto-seleccionar).
+            device_index: Indice del dispositivo de audio (None = auto-seleccionar).
             sample_rate: Frecuencia de muestreo en Hz.
-            block_size: Tamaño de bloque para análisis de audio.
+            block_size: Tamano de bloque para analisis de audio.
             rms_threshold: Umbral RMS legacy (mantenido por compatibilidad).
-            post_detection_cooldown: Segundos de cooldown post-detección de bite.
-            cast_threshold_factor: Múltiplo de baseline para umbral de cast.
-            bite_threshold_factor: Múltiplo de baseline para umbral de bite.
-            min_absolute_threshold: Umbral mínimo absoluto (floor).
+            post_detection_cooldown: Segundos de cooldown post-deteccion de bite.
+            cast_threshold_factor: Multiplo de baseline para umbral de cast.
+            bite_threshold_factor: Multiplo de baseline para umbral de bite.
+            min_absolute_threshold: Umbral minimo absoluto (floor).
             ignore_after_cast_seconds: Ventana de silencio tras el pico de cast.
             bite_detection_timeout_secs: Timeout global para detectar el bite.
+            reset_factor: Multiplo de baseline para el nivel de reset.
         """
         self.device_index: Optional[int] = device_index
         self.sample_rate: int = sample_rate
@@ -86,12 +96,13 @@ class AudioListener:
         self.rms_threshold: float = rms_threshold
         self.post_detection_cooldown: float = post_detection_cooldown
 
-        # Parámetros del modelo de dos picos
+        # Parametros del modelo de dos picos
         self.cast_threshold_factor: float = cast_threshold_factor
         self.bite_threshold_factor: float = bite_threshold_factor
         self.min_absolute_threshold: float = min_absolute_threshold
         self.ignore_after_cast_seconds: float = ignore_after_cast_seconds
         self.bite_detection_timeout_secs: float = bite_detection_timeout_secs
+        self.reset_factor: float = reset_factor
 
         # Estado interno del stream
         self._stream: Optional[sd.InputStream] = None
@@ -101,7 +112,7 @@ class AudioListener:
         self._running: bool = False
         self._rms_history: list[float] = []
 
-        # Estado de la máquina de estados por cast
+        # Estado de la maquina de estados por cast
         self._cast_state: CastState = CastState.TIMED_OUT
         self._cast_splash_time: float = 0.0
         self._bite_detected: bool = False
@@ -112,16 +123,12 @@ class AudioListener:
         self._last_detection_time: float = 0.0
 
     # -----------------------------------------------------------------
-    # Propiedades de umbrales dinámicos
+    # Propiedades de umbrales dinamicos
     # -----------------------------------------------------------------
 
     @property
     def cast_threshold(self) -> float:
-        """Umbral dinámico para detectar el pico de cast splash.
-
-        Returns:
-            max(min_absolute_threshold, baseline_rms * cast_threshold_factor)
-        """
+        """Umbral dinamico para detectar el pico de cast splash."""
         return max(
             self.min_absolute_threshold,
             self._baseline_rms * self.cast_threshold_factor,
@@ -129,14 +136,23 @@ class AudioListener:
 
     @property
     def bite_threshold(self) -> float:
-        """Umbral dinámico para detectar el pico de fish bite.
-
-        Returns:
-            max(min_absolute_threshold, baseline_rms * bite_threshold_factor)
-        """
+        """Umbral dinamico para detectar el pico de fish bite."""
         return max(
             self.min_absolute_threshold,
             self._baseline_rms * self.bite_threshold_factor,
+        )
+
+    @property
+    def reset_level(self) -> float:
+        """Nivel de reset: RMS debe caer por debajo de este valor
+        despues de un pico antes de aceptar el siguiente.
+
+        Returns:
+            max(baseline_rms * reset_factor, baseline_rms * 2)
+        """
+        return max(
+            self._baseline_rms * self.reset_factor,
+            self._baseline_rms * 2.0,
         )
 
     # -----------------------------------------------------------------
@@ -145,11 +161,7 @@ class AudioListener:
 
     @staticmethod
     def list_loopback_devices() -> list[dict[str, Any]]:
-        """Lista todos los dispositivos de entrada disponibles que pueden usarse para loopback.
-
-        Returns:
-            Lista de diccionarios con info del dispositivo (index, name, channels, samplerate).
-        """
+        """Lista todos los dispositivos de entrada disponibles."""
         devices: list[dict[str, Any]] = []
         all_devices = sd.query_devices()
 
@@ -170,18 +182,14 @@ class AudioListener:
 
     @staticmethod
     def find_loopback_device() -> Optional[int]:
-        """Busca automáticamente un dispositivo de loopback WASAPI / Stereo Mix.
-
-        Returns:
-            Índice del dispositivo encontrado, o None si no se encuentra.
-        """
+        """Busca automaticamente un dispositivo de loopback WASAPI / Stereo Mix."""
         devices = AudioListener.list_loopback_devices()
         priority_keywords = [
             "steam streaming speakers",
             "wasapi loopback",
             "loopback",
             "stereo mix",
-            "mezcla estéreo",
+            "mezcla estereo",
             "wave out",
             "what u hear",
             "what you hear",
@@ -220,7 +228,7 @@ class AudioListener:
                 )
 
     # -----------------------------------------------------------------
-    # Callback de audio (alimenta RMS + máquina de estados)
+    # Callback de audio (alimenta RMS + maquina de estados)
     # -----------------------------------------------------------------
 
     def _audio_callback(
@@ -230,17 +238,10 @@ class AudioListener:
         time_info: Any,
         status: sd.CallbackFlags,
     ) -> None:
-        """Callback del stream de audio — calcula RMS y alimenta la máquina de estados.
+        """Callback del stream de audio -- calcula RMS y actualiza baseline.
 
-        El callback SOLO actualiza la baseline y el último RMS.
-        La lógica de la máquina de estados se ejecuta en el hilo principal
+        La logica de la maquina de estados se ejecuta en el hilo principal
         (wait_for_cast_and_bite) para evitar problemas de concurrencia.
-
-        Args:
-            indata: Datos de audio del bloque actual.
-            frames: Número de frames en el bloque.
-            time_info: Información de tiempo del stream.
-            status: Flags de estado del callback.
         """
         if status:
             logger.warning("Estado del stream de audio: %s", status)
@@ -252,16 +253,15 @@ class AudioListener:
         rms: float = float(np.sqrt(np.mean(indata.astype(np.float64) ** 2)))
         self._last_rms = rms
 
-        # Mantener historial para baseline adaptativo (últimos 100 bloques)
+        # Mantener historial para baseline adaptativo (ultimos 100 bloques)
         self._rms_history.append(rms)
         if len(self._rms_history) > 100:
             self._rms_history.pop(0)
 
-        # Actualizar baseline sólo con bloques que NO sean spikes
-        # (usa los 50 valores más bajos del historial para no contaminar)
+        # Actualizar baseline solo con bloques que NO sean spikes
+        # (usa los 50 valores mas bajos del historial para no contaminar)
         if len(self._rms_history) >= 10:
             sorted_recent = sorted(self._rms_history)
-            # Tomar el percentil bajo (primera mitad) para baseline estable
             low_half = sorted_recent[: len(sorted_recent) // 2]
             self._baseline_rms = float(np.mean(low_half))
 
@@ -270,11 +270,7 @@ class AudioListener:
     # -----------------------------------------------------------------
 
     def start_stream(self) -> None:
-        """Inicia el stream de captura de audio.
-
-        Raises:
-            RuntimeError: Si no se puede iniciar el stream tras múltiples intentos.
-        """
+        """Inicia el stream de captura de audio."""
         if self._stream is not None:
             self.stop_stream()
 
@@ -317,11 +313,7 @@ class AudioListener:
         logger.info("Stream de audio detenido.")
 
     def _try_reconnect(self) -> None:
-        """Intenta reconectar el stream hasta un máximo de intentos.
-
-        Raises:
-            RuntimeError: Si se agotan los intentos de reconexión.
-        """
+        """Intenta reconectar el stream hasta un maximo de intentos."""
         self._reconnect_attempts += 1
         if self._reconnect_attempts > self._max_reconnects:
             msg = (
@@ -332,7 +324,7 @@ class AudioListener:
             raise RuntimeError(msg)
 
         logger.warning(
-            "Reintentando conexión de audio (%d/%d)...",
+            "Reintentando conexion de audio (%d/%d)...",
             self._reconnect_attempts,
             self._max_reconnects,
         )
@@ -340,11 +332,7 @@ class AudioListener:
         self.start_stream()
 
     def _ensure_stream_alive(self) -> bool:
-        """Verifica que el stream siga activo e intenta reconectar si no.
-
-        Returns:
-            True si el stream está activo, False si la reconexión falló.
-        """
+        """Verifica que el stream siga activo e intenta reconectar si no."""
         if self._stream is not None and self._stream.active:
             return True
         logger.warning("Stream de audio perdido.")
@@ -355,7 +343,8 @@ class AudioListener:
             return False
 
     # -----------------------------------------------------------------
-    # Método principal: detección de dos picos (cast → bite)
+    # Metodo principal: deteccion de dos picos (cast -> bite)
+    # con reset-level estricto
     # -----------------------------------------------------------------
 
     def wait_for_cast_and_bite(
@@ -363,40 +352,43 @@ class AudioListener:
         bite_timeout: Optional[float] = None,
         cast_splash_timeout: float = 5.0,
     ) -> bool:
-        """Espera el ciclo completo: pico de cast splash → ignore → pico de bite.
+        """Espera el ciclo completo: cast splash -> ignore -> reset -> bite.
 
-        Implementa la máquina de estados:
-          1. WAITING_FOR_CAST_SPLASH — espera el primer spike > cast_threshold
-          2. IGNORING_FIRST_PEAK — ventana de silencio (ignore_after_cast_seconds)
-          3. WAITING_FOR_BITE — espera el segundo spike > bite_threshold
-          4. BITE_DETECTED o TIMED_OUT
+        Maquina de estados:
+          1. WAITING_FOR_CAST_SPLASH -- espera primer spike > cast_threshold
+          2. IGNORING_FIRST_PEAK -- ventana de silencio (ignore_after_cast_seconds)
+          3. WAITING_FOR_RESET -- espera que RMS caiga por debajo de reset_level
+          4. WAITING_FOR_BITE -- espera segundo spike > bite_threshold
+          5. BITE_DETECTED o TIMED_OUT
 
         Args:
             bite_timeout: Timeout global para el bite tras el cast.
                           None = usa self.bite_detection_timeout_secs.
-            cast_splash_timeout: Máx. segundos para detectar el primer pico
+            cast_splash_timeout: Max. segundos para detectar el primer pico
                                  de cast splash (default 5s).
 
         Returns:
-            True si se detectó el bite (segundo pico), False si timeout.
+            True si se detecto el bite (segundo pico), False si timeout.
         """
         if bite_timeout is None:
             bite_timeout = self.bite_detection_timeout_secs
 
         ct = self.cast_threshold
         bt = self.bite_threshold
+        rl = self.reset_level
 
-        logger.debug(
-            "Iniciando detección cast→bite | baseline=%.8f | "
-            "cast_thr=%.6f | bite_thr=%.6f | ignore=%.2fs | timeout=%.1fs",
+        logger.info(
+            "Deteccion cast->bite | baseline=%.8f | cast_thr=%.6f | "
+            "bite_thr=%.6f | reset_lvl=%.8f | ignore=%.2fs | timeout=%.1fs",
             self._baseline_rms,
             ct,
             bt,
+            rl,
             self.ignore_after_cast_seconds,
             bite_timeout,
         )
 
-        # ── FASE 1: Esperar cast splash ──────────────────────────────
+        # -- FASE 1: Esperar cast splash -----------------------------------
         self._cast_state = CastState.WAITING_FOR_CAST_SPLASH
         phase1_start = time.time()
 
@@ -405,10 +397,11 @@ class AudioListener:
                 return False
 
             rms = self._last_rms
+
             if rms > ct:
                 self._cast_splash_time = time.time()
                 self._cast_state = CastState.IGNORING_FIRST_PEAK
-                logger.debug(
+                logger.info(
                     "CAST SPLASH detectado | rms=%.8f > cast_thr=%.6f | "
                     "baseline=%.8f | t=%.3fs",
                     rms,
@@ -420,17 +413,15 @@ class AudioListener:
 
             time.sleep(0.005)
         else:
-            # No se detectó ni siquiera el cast splash — puede ser normal
-            # si el volumen del juego es muy bajo. Transicionar directamente
-            # a esperar bite sin exigir cast splash previo.
-            logger.debug(
-                "No se detectó cast splash en %.1fs — esperando bite directamente.",
+            # No se detecto cast splash -- transicionar directo a esperar bite
+            logger.info(
+                "No se detecto cast splash en %.1fs -- esperando bite directamente.",
                 cast_splash_timeout,
             )
             self._cast_state = CastState.WAITING_FOR_BITE
             self._cast_splash_time = time.time()
 
-        # ── FASE 2: Ventana de silencio (ignorar reverb del cast) ────
+        # -- FASE 2: Ventana de silencio (ignorar reverb del cast) ----------
         if self._cast_state == CastState.IGNORING_FIRST_PEAK:
             ignore_end = self._cast_splash_time + self.ignore_after_cast_seconds
             logger.debug(
@@ -439,10 +430,42 @@ class AudioListener:
             )
             while time.time() < ignore_end:
                 time.sleep(0.005)
-            self._cast_state = CastState.WAITING_FOR_BITE
-            logger.debug("Ventana de silencio terminada — escuchando bite.")
+            self._cast_state = CastState.WAITING_FOR_RESET
+            logger.debug("Ventana de silencio terminada -- esperando reset level.")
 
-        # ── FASE 3: Esperar bite (segundo pico) ─────────────────────
+        # -- FASE 2.5: Esperar que RMS caiga por debajo de reset_level ------
+        if self._cast_state == CastState.WAITING_FOR_RESET:
+            reset_start = time.time()
+            # Dar un maximo de bite_timeout para que caiga; si no, timeout.
+            while time.time() - reset_start < bite_timeout:
+                if not self._ensure_stream_alive():
+                    return False
+
+                rms = self._last_rms
+                if rms <= rl:
+                    self._cast_state = CastState.WAITING_FOR_BITE
+                    logger.info(
+                        "RMS volvio a reset level | rms=%.8f <= reset_lvl=%.8f | "
+                        "t_reset=%.3fs",
+                        rms,
+                        rl,
+                        time.time() - reset_start,
+                    )
+                    break
+
+                time.sleep(0.005)
+            else:
+                self._cast_state = CastState.TIMED_OUT
+                logger.info(
+                    "Timeout esperando reset level (%.1fs) | "
+                    "last_rms=%.8f | reset_lvl=%.8f",
+                    bite_timeout,
+                    self._last_rms,
+                    rl,
+                )
+                return False
+
+        # -- FASE 3: Esperar bite (segundo pico) ----------------------------
         bite_start = time.time()
 
         while time.time() - bite_start < bite_timeout:
@@ -455,7 +478,7 @@ class AudioListener:
                 self._bite_detected = True
                 elapsed_total = time.time() - phase1_start
                 logger.info(
-                    "¡BITE detectado! | rms=%.8f > bite_thr=%.6f | "
+                    "BITE detectado! | rms=%.8f > bite_thr=%.6f | "
                     "baseline=%.8f | t_total=%.2fs",
                     rms,
                     bt,
@@ -477,40 +500,33 @@ class AudioListener:
         return False
 
     # -----------------------------------------------------------------
-    # Legacy: wait_for_splash (compatibilidad con código existente)
+    # Legacy: wait_for_splash (compatibilidad con codigo existente)
     # -----------------------------------------------------------------
 
     def wait_for_splash(self, timeout: float = 30.0) -> bool:
         """Espera hasta que se detecte un splash o se agote el timeout (LEGACY).
 
-        Este método ahora delega internamente al modelo de dos picos:
-        ejecuta wait_for_cast_and_bite() con el timeout indicado.
-
-        Args:
-            timeout: Tiempo máximo de espera en segundos.
-
-        Returns:
-            True si se detectó el bite (segundo pico), False si timeout.
+        Delega internamente al modelo de dos picos.
         """
         return self.wait_for_cast_and_bite(bite_timeout=timeout)
 
     # -----------------------------------------------------------------
-    # Calibración
+    # Calibracion y limpieza periodica
     # -----------------------------------------------------------------
 
     def calibrate_baseline(self, duration: float = 2.0) -> float:
-        """Calibra la línea base de ruido ambiental.
+        """Calibra la linea base de ruido ambiental.
 
-        Debe ejecutarse mientras WoW está idle o muy silencioso para
-        obtener una baseline estable (~0.000017 – 0.000020).
+        Debe ejecutarse mientras WoW esta idle para obtener una
+        baseline estable (~0.000017 - 0.000020).
 
         Args:
-            duration: Duración en segundos para la calibración.
+            duration: Duracion en segundos para la calibracion.
 
         Returns:
-            El valor RMS promedio de la línea base calculada.
+            El valor RMS promedio de la linea base calculada.
         """
-        logger.info("Calibrando línea base de audio (%.1fs)...", duration)
+        logger.info("Calibrando linea base de audio (%.1fs)...", duration)
         self._rms_history.clear()
         self._baseline_rms = 0.0
         time.sleep(duration)
@@ -519,17 +535,38 @@ class AudioListener:
             self._baseline_rms = float(np.mean(self._rms_history))
             ct = self.cast_threshold
             bt = self.bite_threshold
+            rl = self.reset_level
             logger.info(
-                "Línea base calibrada: baseline_rms=%.8f | "
-                "cast_threshold=%.6f | bite_threshold=%.6f",
+                "Linea base calibrada: baseline_rms=%.8f | "
+                "cast_threshold=%.6f | bite_threshold=%.6f | reset_level=%.8f",
                 self._baseline_rms,
                 ct,
                 bt,
+                rl,
             )
         else:
-            logger.warning("No se recibieron datos de audio durante calibración.")
+            logger.warning("No se recibieron datos de audio durante calibracion.")
 
         return self._baseline_rms
+
+    def reset_cleanup(self, calibration_duration: float = 2.0) -> float:
+        """Limpieza periodica: borra historial RMS y recalibra baseline.
+
+        Llamar cada N iteraciones para evitar drift en la baseline.
+
+        Args:
+            calibration_duration: Segundos de silencio para recalibrar.
+
+        Returns:
+            Nueva baseline RMS.
+        """
+        logger.info("Ejecutando limpieza periodica (reset_cleanup)...")
+        self._rms_history.clear()
+        self._baseline_rms = 0.0
+        self._cast_state = CastState.TIMED_OUT
+        self._bite_detected = False
+        self._last_rms = 0.0
+        return self.calibrate_baseline(duration=calibration_duration)
 
     # -----------------------------------------------------------------
     # Propiedades
@@ -537,36 +574,20 @@ class AudioListener:
 
     @property
     def baseline_rms(self) -> float:
-        """Valor actual de la línea base RMS.
-
-        Returns:
-            RMS baseline actual.
-        """
+        """Valor actual de la linea base RMS."""
         return self._baseline_rms
 
     @property
     def last_rms(self) -> float:
-        """Último valor RMS leído del stream.
-
-        Returns:
-            Último RMS.
-        """
+        """Ultimo valor RMS leido del stream."""
         return self._last_rms
 
     @property
     def current_state(self) -> CastState:
-        """Estado actual de la máquina de estados.
-
-        Returns:
-            CastState actual.
-        """
+        """Estado actual de la maquina de estados."""
         return self._cast_state
 
     @property
     def is_running(self) -> bool:
-        """Indica si el stream de audio está activo.
-
-        Returns:
-            True si el stream está corriendo.
-        """
+        """Indica si el stream de audio esta activo."""
         return self._running and self._stream is not None and self._stream.active
