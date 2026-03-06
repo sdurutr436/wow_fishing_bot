@@ -1,0 +1,20 @@
+{
+  "keybind": "`",
+  "iterations": 1000,
+  "cast_animation_wait": 1.5,
+  "cast_animation_variance": 0.3,
+  "post_loot_wait": 1.0,
+  "post_loot_variance": 0.2,
+  "detection_timeout_seconds": 30,
+  "post_detection_cooldown": 3.0,
+  "min_human_delay": 0.05,
+  "max_human_delay": 0.30,
+  "rms_threshold": 0.02,
+  "audio_device_index": null,
+  "sample_rate": 44100,
+  "block_size": 1024,
+  "log_level": "INFO",
+  "afk_break_enabled": true,
+  "afk_break_every_n_iterations": 50,
+  "afk_break_duration_seconds": 20
+}
