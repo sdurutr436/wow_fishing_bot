@@ -96,13 +96,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "min_human_delay": 0.05,
     "max_human_delay": 0.30,
     "rms_threshold": 0.02,
-    "audio_device_index": None,
+    "audio_device_index": 41,
     "sample_rate": 44100,
     "block_size": 1024,
     "log_level": "INFO",
     "afk_break_enabled": True,
     "afk_break_every_n_iterations": 50,
     "afk_break_duration_seconds": 20,
+    "cast_threshold_factor": 300.0,
+    "bite_threshold_factor": 500.0,
+    "min_absolute_threshold": 0.005,
+    "ignore_after_cast_seconds": 0.5,
+    "bite_detection_timeout_secs": 20.0,
 }
 
 
@@ -345,10 +350,14 @@ def print_welcome_banner(config: dict[str, Any]) -> None:
     table.add_row("Timeout detección", f'{config["detection_timeout_seconds"]}s')
     table.add_row("Cooldown post-detección", f'{config["post_detection_cooldown"]}s')
     table.add_row("Delay humano", f'{config["min_human_delay"]}s–{config["max_human_delay"]}s')
-    table.add_row("Umbral RMS", str(config["rms_threshold"]))
     table.add_row("Dispositivo audio", str(config["audio_device_index"]))
     table.add_row("Sample rate", f'{config["sample_rate"]} Hz')
     table.add_row("Block size", str(config["block_size"]))
+    table.add_row("Cast threshold factor", str(config.get("cast_threshold_factor", 300.0)))
+    table.add_row("Bite threshold factor", str(config.get("bite_threshold_factor", 500.0)))
+    table.add_row("Min absolute threshold", str(config.get("min_absolute_threshold", 0.005)))
+    table.add_row("Ignore after cast", f'{config.get("ignore_after_cast_seconds", 0.5)}s')
+    table.add_row("Bite detection timeout", f'{config.get("bite_detection_timeout_secs", 20.0)}s')
     table.add_row("Pausas AFK", f'Cada {config["afk_break_every_n_iterations"]} iter, {config["afk_break_duration_seconds"]}s' if config["afk_break_enabled"] else "Desactivadas")
 
     console.print(table)
@@ -375,11 +384,18 @@ def fishing_loop(
     watcher: WindowWatcher,
     tracker: SessionTracker,
 ) -> None:
-    """Ejecuta el bucle principal de pesca.
+    """Ejecuta el bucle principal de pesca con modelo de dos picos.
+
+    Cada iteración:
+      1. Cast (envía tecla)
+      2. Espera animación de cast
+      3. Escucha audio: ignora primer pico (cast splash), espera segundo pico (bite)
+      4. Si bite detectado → delay humano → loot (envía tecla)
+      5. Espera post-loot
 
     Args:
         config: Configuración del bot.
-        audio: Listener de audio para detección de splash.
+        audio: Listener de audio para detección de cast/bite.
         input_handler: Handler de input para enviar teclas.
         watcher: Watcher de ventana de WoW.
         tracker: Tracker de estadísticas de sesión.
@@ -390,7 +406,7 @@ def fishing_loop(
     cast_variance: float = config["cast_animation_variance"]
     post_loot_wait: float = config["post_loot_wait"]
     post_loot_variance: float = config["post_loot_variance"]
-    detection_timeout: float = config["detection_timeout_seconds"]
+    bite_timeout: float = config.get("bite_detection_timeout_secs", 20.0)
     min_delay: float = config["min_human_delay"]
     max_delay: float = config["max_human_delay"]
 
@@ -409,6 +425,7 @@ def fishing_loop(
 
         # 2. Enviar tecla para lanzar caña
         console.print("[cyan]  🎣 Lanzando caña...[/cyan]")
+        logger.debug("Cast #%d — enviando tecla.", iteration)
         if not input_handler.send_key(wow_hwnd):
             logger.error("No se pudo enviar tecla de cast. Reintentando iteración...")
             time.sleep(1.0)
@@ -420,20 +437,23 @@ def fishing_loop(
         console.print(f"[dim]  Esperando animación de cast ({wait_time:.2f}s)...[/dim]")
         time.sleep(wait_time)
 
-        # 4. Escuchar splash (con posibilidad de recast por timeout)
-        splash_detected = False
+        # 4. Detección de dos picos: cast splash → ignore → bite
+        #    (con posibilidad de recast por timeout)
+        bite_detected = False
         recast_count = 0
-        max_recasts = 3  # Máximo recasts por iteración antes de avanzar
+        max_recasts = 3
 
-        while not splash_detected and recast_count <= max_recasts:
-            console.print("[yellow]  👂 Escuchando splash...[/yellow]")
-            splash_detected = audio.wait_for_splash(timeout=detection_timeout)
+        while not bite_detected and recast_count <= max_recasts:
+            console.print(
+                "[yellow]  👂 Escuchando audio (cast splash → ignore → bite)...[/yellow]"
+            )
+            bite_detected = audio.wait_for_cast_and_bite(bite_timeout=bite_timeout)
 
-            if not splash_detected:
+            if not bite_detected:
                 recast_count += 1
                 tracker.record_timeout_recast()
                 console.print(
-                    f"[red]  ⏰ Timeout — recast #{recast_count}[/red]"
+                    f"[red]  ⏰ Timeout sin bite — recast #{recast_count}[/red]"
                 )
 
                 if recast_count > max_recasts:
@@ -445,6 +465,7 @@ def fishing_loop(
                 wow_hwnd = watcher.get_wow_hwnd()
 
                 console.print("[cyan]  🎣 Re-lanzando caña...[/cyan]")
+                logger.debug("Recast #%d en iteración %d.", recast_count, iteration)
                 if not input_handler.send_key(wow_hwnd):
                     logger.error("No se pudo enviar tecla de recast.")
                     break
@@ -453,7 +474,7 @@ def fishing_loop(
                 wait_time = max(0.5, wait_time)
                 time.sleep(wait_time)
 
-        if splash_detected:
+        if bite_detected:
             # 5. Delay humano antes de lootear
             human_wait = random.uniform(min_delay, max_delay)
             console.print(f"[dim]  Delay humano ({human_wait:.3f}s)...[/dim]")
@@ -461,7 +482,7 @@ def fishing_loop(
 
             # 6. Verificar foco y enviar tecla para lootear
             if watcher.is_wow_foreground():
-                console.print("[green]  💰 Looteando...[/green]")
+                console.print("[green]  💰 ¡Bite! Looteando...[/green]")
                 input_handler.send_key_no_delay(wow_hwnd)
                 tracker.record_fish()
             else:
@@ -514,6 +535,11 @@ def main() -> None:
             block_size=config["block_size"],
             rms_threshold=config["rms_threshold"],
             post_detection_cooldown=config["post_detection_cooldown"],
+            cast_threshold_factor=config.get("cast_threshold_factor", 300.0),
+            bite_threshold_factor=config.get("bite_threshold_factor", 500.0),
+            min_absolute_threshold=config.get("min_absolute_threshold", 0.005),
+            ignore_after_cast_seconds=config.get("ignore_after_cast_seconds", 0.5),
+            bite_detection_timeout_secs=config.get("bite_detection_timeout_secs", 20.0),
         )
 
         input_handler = InputHandler(

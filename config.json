@@ -10,11 +10,16 @@
   "min_human_delay": 0.05,
   "max_human_delay": 0.30,
   "rms_threshold": 0.02,
-  "audio_device_index": null,
+  "audio_device_index": 41,
   "sample_rate": 44100,
   "block_size": 1024,
   "log_level": "INFO",
   "afk_break_enabled": true,
   "afk_break_every_n_iterations": 50,
-  "afk_break_duration_seconds": 20
+  "afk_break_duration_seconds": 20,
+  "cast_threshold_factor": 300.0,
+  "bite_threshold_factor": 500.0,
+  "min_absolute_threshold": 0.005,
+  "ignore_after_cast_seconds": 0.5,
+  "bite_detection_timeout_secs": 20.0
 }
